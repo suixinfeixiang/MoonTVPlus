@@ -2,10 +2,12 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 
 const { PHASE_DEVELOPMENT_SERVER } = require('next/constants');
-const webpack = require('webpack');
+const path = require('path');
 
-// 检测是否为 Cloudflare Pages 构建
+// 检测是否为边缘平台构建
 const isCloudflare = process.env.CF_PAGES === '1' || process.env.BUILD_TARGET === 'cloudflare';
+const isEdgeOne = process.env.EDGEONE_PAGES === '1' || process.env.BUILD_TARGET === 'edgeone';
+const isEdgeBuild = isCloudflare || isEdgeOne;
 
 const optimizedPackageImports = [
   '@dnd-kit/core',
@@ -17,49 +19,12 @@ const optimizedPackageImports = [
   'react-icons',
 ];
 
-const serverExternalPackages = [
-  '@upstash/redis',
-  // @upstash/redis depends on uncrypto, whose package exports include a
-  // workerd condition. OpenNext needs it traced as a full external package,
-  // otherwise .open-next may contain package.json without dist/crypto.web.mjs.
-  'uncrypto',
-  '@vercel/postgres',
-  'better-sqlite3',
-  'cheerio',
-  'nodemailer',
-  'pg',
-  'redis',
-  'socket.io',
-  'xml2js',
-  'xpath',
-];
-
-// 仅在开发环境或 Cloudflare 环境下排除 6b85c446 和 706b2fe 引入的 external 包；
-// 其它未来加入的 server external 包不受影响。
-const buildExcludedServerExternalPackages = [
-  '@upstash/redis',
-  'uncrypto',
-  '@vercel/postgres',
-  'better-sqlite3',
-  'cheerio',
-  'nodemailer',
-  'pg',
-  'redis',
-  'socket.io',
-  'xml2js',
-  'xpath',
-];
-
 const createNextConfig = (phase) => {
   const isDevelopment = phase === PHASE_DEVELOPMENT_SERVER || process.env.NODE_ENV === 'development';
-  const effectiveServerExternalPackages =
-    isDevelopment || isCloudflare
-      ? serverExternalPackages.filter((pkg) => !buildExcludedServerExternalPackages.includes(pkg))
-      : serverExternalPackages;
 
   const nextConfig = {
   // Cloudflare Pages 不支持 standalone，使用默认输出
-  output: isCloudflare ? undefined : 'standalone',
+  output: isEdgeBuild ? undefined : 'standalone',
   eslint: {
     dirs: ['src'],
     // 在生产构建时忽略 ESLint 错误
@@ -69,13 +34,31 @@ const createNextConfig = (phase) => {
   reactStrictMode: false,
   swcMinify: true,
 
+  // OpenNext/esbuild 使用 workerd condition 解析依赖。
+  // @libsql/* 等包有 workerd 专用入口（如 web.cjs），Next NFT 默认只追踪 node 入口，
+  // 导致 .open-next 里缺少 web.cjs 并报 Could not resolve "@libsql/isomorphic-ws"。
+  // 声明为 server external 后，OpenNext 会完整拷贝这些包并应用 workerd 导出。
+  // 参见: https://opennext.js.org/cloudflare/howtos/workerd
+  serverExternalPackages: [
+    '@libsql/client',
+    '@libsql/hrana-client',
+    '@libsql/isomorphic-ws',
+    '@libsql/isomorphic-fetch',
+    'libsql',
+  ],
+
   experimental: {
-    instrumentationHook: process.env.NODE_ENV === 'production' && !isCloudflare,
+    instrumentationHook: process.env.NODE_ENV === 'production' && !isEdgeBuild,
     optimizePackageImports: optimizedPackageImports,
-    ...(effectiveServerExternalPackages.length
-      ? { serverComponentsExternalPackages: effectiveServerExternalPackages }
-      : {}),
-    webpackBuildWorker: !isCloudflare,
+    webpackBuildWorker: !isEdgeBuild,
+    // Next 14.2 仍可能读取此字段；与 serverExternalPackages 保持一致
+    serverComponentsExternalPackages: [
+      '@libsql/client',
+      '@libsql/hrana-client',
+      '@libsql/isomorphic-ws',
+      '@libsql/isomorphic-fetch',
+      'libsql',
+    ],
   },
 
   // Uncoment to add domain whitelist
@@ -130,15 +113,43 @@ const createNextConfig = (phase) => {
     };
 
     // Cloudflare 使用 D1，不需要把 better-sqlite3 原生模块带入 Worker 产物。
-    if (isCloudflare) {
-      config.plugins.push(
-        new webpack.IgnorePlugin({
-          resourceRegExp: /^better-sqlite3$/,
-        })
-      );
+    if (isEdgeBuild) {
       config.resolve.alias = {
         ...config.resolve.alias,
-        'better-sqlite3': false,
+        ...Object.fromEntries(
+          [
+            'better-sqlite3',
+            'sharp',
+            'nodemailer',
+            'socket.io',
+            'redis',
+            '@vercel/postgres',
+            'pg',
+            'libsql',
+            '@libsql/isomorphic-fetch',
+            '@libsql/isomorphic-ws',
+          ].map((pkg) => [
+            pkg,
+            path.resolve(
+              __dirname,
+              'src/lib/cloudflare-shims/node-unsupported.ts'
+            ),
+          ])
+        ),
+        // Cloudflare Workers 有原生 fetch；代理 Agent 在 Workers 中不可用。
+        // 用轻量 shim 替换 node-fetch / https-proxy-agent，避免把 Node HTTP 栈打入 Worker。
+        'node-fetch': path.resolve(
+          __dirname,
+          'src/lib/cloudflare-shims/node-fetch.ts'
+        ),
+        ...(isCloudflare
+          ? {
+              'https-proxy-agent': path.resolve(
+                __dirname,
+                'src/lib/cloudflare-shims/https-proxy-agent.ts'
+              ),
+            }
+          : {}),
       };
       config.externals = (config.externals || []).filter((external) => {
         return !(
@@ -149,13 +160,14 @@ const createNextConfig = (phase) => {
       });
     }
 
-    // Exclude better-sqlite3, D1, and Postgres modules from client-side bundle
+    // Exclude better-sqlite3, D1, Postgres, and Turso modules from client-side bundle
     if (!isServer) {
       config.externals = config.externals || [];
       config.externals.push({
         'better-sqlite3': 'commonjs better-sqlite3',
         '@vercel/postgres': 'commonjs @vercel/postgres',
         'pg': 'commonjs pg',
+        '@libsql/client': 'commonjs @libsql/client',
       });
 
       config.resolve.alias = {
@@ -165,6 +177,7 @@ const createNextConfig = (phase) => {
         '@/lib/d1-adapter': false,
         '@/lib/postgres.db': false,
         '@/lib/postgres-adapter': false,
+        '@/lib/turso-adapter': false,
       };
     }
 
@@ -175,7 +188,7 @@ const createNextConfig = (phase) => {
   // next-pwa runs an additional webpack pass that is not needed for the
   // Cloudflare/OpenNext worker bundle and can make Cloudflare builds fail with
   // a generic "Build failed because of webpack errors" message.
-  if (isDevelopment || isCloudflare) {
+  if (isDevelopment || isEdgeBuild) {
     return nextConfig;
   }
 
@@ -183,6 +196,7 @@ const createNextConfig = (phase) => {
     dest: 'public',
     register: true,
     skipWaiting: true,
+    importScripts: ['/push-sw.js'],
   });
 
   return withPWA(nextConfig);
